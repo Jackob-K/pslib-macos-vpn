@@ -1,59 +1,52 @@
 #!/usr/bin/env bash
+
+# Nikdy nedovol zdedenemu `bash -x` vypsat citlive operace.
+set +x
 set -Eeuo pipefail
+umask 077
 
-VERSION="0.1.0"
-
+VERSION="0.9.0"
 VPN_HOST="hecate.pslib.cz"
-ROUTES=("10.10.10.0/24")
-SMB_HOSTS=("athena.ad.pslib.cz")
+VPN_PORT="443"
+VPN_ROUTE="10.10.10.0/24"
+VPN_ROUTE_PROBE="10.10.10.10"
 KEYCHAIN_SERVICE="pslib-macos-vpn"
+SESSION_MARKER="pslib-vpn"
 
-CONFIG_DIR="${HOME}/.config/pslib-vpn"
+CONFIG_DIR="${PSLIB_CONFIG_DIR:-${HOME}/.config/pslib-vpn}"
 USERNAME_FILE="${CONFIG_DIR}/username"
-MOUNTS_FILE="${CONFIG_DIR}/mounts"
+SETTINGS_FILE="${CONFIG_DIR}/settings"
+RUNTIME_DIR="${PSLIB_RUNTIME_DIR:-${CONFIG_DIR}/run}"
+MOUNT_STATE_FILE="${RUNTIME_DIR}/mounted-volumes"
+ROUTE_STATE_FILE="${RUNTIME_DIR}/managed-route"
+LOCK_DIR="${RUNTIME_DIR}/connect.lock"
 
-die() {
-  printf 'pslib-vpn: %s\n' "$*" >&2
-  exit 1
-}
+PSLIB_USER=""
+SELECTED_DISKS="S,X"
+X_HOME=""
+CLEANED_UP=0
+VPN_LOG=""
+VPN_PID=""
+INITIAL_PPP_INTERFACES=""
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'Upozorneni: %s\n' "$*" >&2; }
+die() { printf 'Chyba: %s\n' "$*" >&2; exit 1; }
 
 require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Chybí příkaz '$1'."
+  command -v "$1" >/dev/null 2>&1 || die "Chybi prikaz '$1'. Spust 'pslib-vpn doctor'."
 }
 
-brew_prefix() {
-  brew --prefix
+ensure_private_dir() {
+  mkdir -p "$1"
+  chmod 700 "$1"
 }
 
-ca_cert() {
-  local cert
-  cert="$(brew_prefix)/etc/ca-certificates/cert.pem"
-  [[ -r "$cert" ]] || die "CA bundle nebyl nalezen: $cert. Zkus: brew install ca-certificates"
-  printf '%s\n' "$cert"
-}
-
-vpn_host_regex() {
-  printf '%s\n' "${VPN_HOST//./\\.}"
-}
-
-find_ppp_interface() {
-  local iface
-  for iface in $(ifconfig -l); do
-    case "$iface" in
-      ppp*)
-        if ifconfig "$iface" 2>/dev/null | grep -q 'inet '; then
-          printf '%s\n' "$iface"
-          return 0
-        fi
-        ;;
-    esac
-  done
-  return 1
-}
-
-route_interface() {
-  local destination="${1:-10.10.10.10}"
-  route -n get "$destination" 2>/dev/null | awk '/interface:/{print $2; exit}'
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s\n' "$value"
 }
 
 username_without_realm() {
@@ -62,263 +55,699 @@ username_without_realm() {
   printf '%s\n' "$username"
 }
 
-setup_credentials() {
-  mkdir -p "$CONFIG_DIR"
-  chmod 700 "$CONFIG_DIR"
+validate_username() { [[ "$1" =~ ^[A-Za-z0-9._@-]+$ ]]; }
+validate_x_home() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+vpn_keychain_service() { printf '%s\n' "$KEYCHAIN_SERVICE"; }
 
-  local username password
-  if [[ -f "$USERNAME_FILE" ]]; then
-    username="$(cat "$USERNAME_FILE")"
-    printf 'Aktuální uživatel: %s\n' "$username"
-    read -r -p "Změnit uživatelské jméno? [y/N] " answer
-    case "$answer" in
-      y|Y|yes|YES)
-        read -r -p "PSLIB uživatel (např. jmeno.prijmeni@pslib.cz): " username
-        ;;
-    esac
-  else
-    read -r -p "PSLIB uživatel (např. jmeno.prijmeni@pslib.cz): " username
-  fi
+keychain_has_vpn_password() {
+  security find-generic-password -a "$PSLIB_USER" \
+    -s "$(vpn_keychain_service)" -w >/dev/null 2>&1
+}
 
-  [[ -n "$username" ]] || die "Uživatelské jméno nesmí být prázdné."
-  printf '%s\n' "$username" > "$USERNAME_FILE"
+store_vpn_password() {
+  local username="$1"
+  say "Zadej heslo do skolni site. Pri psani se nebude zobrazovat."
+  security add-generic-password -U -a "$username" \
+    -s "$(vpn_keychain_service)" -l "PSLIB VPN" -w || \
+    die "Heslo se nepodarilo ulozit do macOS Keychainu. Zkus prikaz znovu."
+}
+
+write_username() {
+  ensure_private_dir "$CONFIG_DIR"
+  printf '%s\n' "$1" >"$USERNAME_FILE"
   chmod 600 "$USERNAME_FILE"
-
-  read -r -s -p "Heslo do školní sítě: " password
-  printf '\n'
-  [[ -n "$password" ]] || die "Heslo nesmí být prázdné."
-
-  security add-generic-password \
-    -U \
-    -a "$username" \
-    -s "$KEYCHAIN_SERVICE" \
-    -w "$password" >/dev/null
-
-  unset password
-
-  if [[ ! -f "$MOUNTS_FILE" ]]; then
-    cat > "$MOUNTS_FILE" <<'EOF'
-# Jeden SMB URL na řádek. Po připojení VPN se nekomentované položky otevřou ve Finderu.
-# Při ukončení VPN se SMB svazky ze serveru athena.ad.pslib.cz odpojí.
-#
-# Veřejně dokumentovaný společný disk S:
-smb://athena.ad.pslib.cz/public
-#
-# Osobní disk X:
-# smb://athena.ad.pslib.cz/doma$/__PSLIB_USERNAME__
-#
-# Další disky (např. L: a W:) doplň sem, pokud znáš jejich SMB cestu
-# a máš k nim oprávnění. Některé sdílené disky mohou vyžadovat další
-# ověření ve Finderu nebo Keychainu.
-EOF
-    local short_username
-    short_username="$(username_without_realm "$username")"
-    perl -0pi -e "s/__PSLIB_USERNAME__/\Q$short_username\E/g" "$MOUNTS_FILE"
-    chmod 600 "$MOUNTS_FILE"
-  fi
-
-  printf 'Nastavení uloženo. Heslo je v macOS Keychainu.\n'
 }
 
 load_username() {
-  [[ -r "$USERNAME_FILE" ]] || die "Nejdřív spusť: pslib-vpn setup"
-  PSLIB_USER="$(cat "$USERNAME_FILE")"
-  [[ -n "$PSLIB_USER" ]] || die "Prázdné uživatelské jméno v $USERNAME_FILE."
+  [[ -r "$USERNAME_FILE" ]] || die "Chybi nastaveni uctu. Spust: pslib-vpn setup"
+  IFS= read -r PSLIB_USER <"$USERNAME_FILE" || true
+  [[ -n "$PSLIB_USER" ]] || die "Ulozene uzivatelske jmeno je prazdne. Spust: pslib-vpn credentials"
+  validate_username "$PSLIB_USER" || die "Ulozene uzivatelske jmeno ma nepovoleny format. Spust: pslib-vpn credentials"
 }
 
-load_password() {
-  VPN_PASSWORD="$(
-    security find-generic-password \
-      -a "$PSLIB_USER" \
-      -s "$KEYCHAIN_SERVICE" \
-      -w 2>/dev/null
-  )" || die "Heslo nebylo nalezeno v Keychainu. Spusť: pslib-vpn setup"
+load_settings() {
+  local key value normalized
+  SELECTED_DISKS="S,X"
+  X_HOME=""
+  if [[ -r "$SETTINGS_FILE" ]]; then
+    while IFS='=' read -r key value || [[ -n "${key}${value}" ]]; do
+      case "$key" in
+        DISKS) SELECTED_DISKS="$value" ;;
+        X_HOME) X_HOME="$value" ;;
+      esac
+    done <"$SETTINGS_FILE"
+  fi
+  if [[ -z "$X_HOME" && -n "$PSLIB_USER" ]]; then
+    X_HOME="$(username_without_realm "$PSLIB_USER")"
+  fi
+  normalized="$(normalize_disk_selection "$SELECTED_DISKS")" || return 1
+  SELECTED_DISKS="$normalized"
 }
 
-add_routes() {
-  local iface="$1" network
-  for network in "${ROUTES[@]}"; do
-    sudo route -n delete -net "$network" >/dev/null 2>&1 || true
-    sudo route -n add -net "$network" -interface "$iface" >/dev/null
+normalize_disk_selection() {
+  local raw token result="" old_ifs
+  raw="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr ',;' '  ')"
+  old_ifs="$IFS"
+  IFS=' '
+  for token in $raw; do
+    case "$token" in
+      S|X|L|W)
+        case ",$result," in
+          *",$token,"*) ;;
+          *) result="${result:+${result},}${token}" ;;
+        esac
+        ;;
+      *) IFS="$old_ifs"; return 1 ;;
+    esac
+  done
+  IFS="$old_ifs"
+  [[ -n "$result" ]] || return 1
+  printf '%s\n' "$result"
+}
+
+disk_selected() {
+  case ",${SELECTED_DISKS}," in
+    *",$1,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+configure_disks() {
+  local answer normalized proposed_x
+  say "Vyber disky pro automaticke pripojeni:"
+  say "  S - spolecny skolni prostor"
+  say "  X - osobni adresar"
+  say "  L - Bakalari (hlavne pro ucitele, vlastni prihlaseni)"
+  say "  W - verejne weby (nektere ucty nemaji pristup)"
+  read -r -p "Disky oddelene mezerou [S X]: " answer
+  answer="$(trim "$answer")"
+  [[ -n "$answer" ]] || answer="S X"
+  normalized="$(normalize_disk_selection "$answer")" || \
+    die "Neplatny vyber. Pouzij pouze pismena S, X, L a W."
+  SELECTED_DISKS="$normalized"
+
+  proposed_x="$(username_without_realm "$PSLIB_USER")"
+  if disk_selected X; then
+    read -r -p "Nazev osobniho adresare X [$proposed_x]: " answer
+    answer="$(trim "$answer")"
+    X_HOME="${answer:-$proposed_x}"
+    validate_x_home "$X_HOME" || \
+      die "Nazev X muze obsahovat jen pismena, cisla, tecku, pomlcku a podtrzitko."
+  else
+    X_HOME="$proposed_x"
+  fi
+
+  ensure_private_dir "$CONFIG_DIR"
+  {
+    printf 'DISKS=%s\n' "$SELECTED_DISKS"
+    printf 'X_HOME=%s\n' "$X_HOME"
+  } >"$SETTINGS_FILE"
+  chmod 600 "$SETTINGS_FILE"
+
+  if disk_selected L; then
+    say "Disk L si pri prvnim pripojeni vyzada skolni e-mail a sitove heslo."
+    say "Ulozeni hesla probiha jen pres systemovy dialog macOS pro bakalar.ad.pslib.cz."
+  fi
+}
+
+update_credentials() {
+  require_cmd security
+  local old_username="" username answer
+  if [[ -r "$USERNAME_FILE" ]]; then
+    IFS= read -r old_username <"$USERNAME_FILE" || true
+  fi
+  if [[ -n "$old_username" ]]; then
+    read -r -p "Skolni uzivatelske jmeno [$old_username]: " answer
+    answer="$(trim "$answer")"
+    username="${answer:-$old_username}"
+  else
+    read -r -p "Skolni uzivatelske jmeno (napr. jmeno.prijmeni@pslib.cz): " username
+    username="$(trim "$username")"
+  fi
+  [[ -n "$username" ]] || die "Uzivatelske jmeno nesmi byt prazdne."
+  validate_username "$username" || \
+    die "Uzivatelske jmeno obsahuje nepovolene znaky."
+
+  store_vpn_password "$username"
+  write_username "$username"
+  PSLIB_USER="$username"
+  if [[ -n "$old_username" && "$old_username" != "$username" ]]; then
+    security delete-generic-password -a "$old_username" \
+      -s "$(vpn_keychain_service)" >/dev/null 2>&1 || true
+  fi
+  say "VPN udaje byly bezpecne ulozeny do macOS Keychainu."
+}
+
+setup() {
+  say "Prvni nastaveni PSLIB VPN"
+  update_credentials
+  if ! load_settings; then
+    SELECTED_DISKS="S,X"
+    X_HOME="$(username_without_realm "$PSLIB_USER")"
+  fi
+  configure_disks
+  say "Nastaveni je hotove. Pripojis se prikazem: pslib-vpn"
+}
+
+forget_credentials() {
+  require_cmd security
+  local answer
+  if [[ ! -r "$USERNAME_FILE" ]]; then
+    say "Nejsou ulozeny zadne VPN prihlasovaci udaje."
+    return 0
+  fi
+  load_username
+  read -r -p "Opravdu odstranit VPN heslo z Keychainu? [y/N] " answer
+  case "$answer" in
+    y|Y|yes|YES|ano|ANO) ;;
+    *) say "Beze zmeny."; return 0 ;;
+  esac
+  if security delete-generic-password -a "$PSLIB_USER" \
+    -s "$(vpn_keychain_service)" >/dev/null 2>&1; then
+    say "VPN heslo bylo z Keychainu odstraneno."
+  else
+    warn "Odpovidajici heslo v Keychainu nebylo nalezeno."
+  fi
+  rm -f "$USERNAME_FILE"
+}
+
+brew_prefix() { brew --prefix; }
+
+ca_cert() {
+  local cert
+  cert="$(brew_prefix)/etc/ca-certificates/cert.pem"
+  [[ -r "$cert" ]] || die "Chybi CA certifikaty. Spust: brew install ca-certificates"
+  printf '%s\n' "$cert"
+}
+
+shell_quote() {
+  local value="$1"
+  value=${value//\'/\'\\\'\'}
+  printf "'%s'" "$value"
+}
+
+list_ppp_interfaces() {
+  local iface
+  for iface in $(ifconfig -l 2>/dev/null); do
+    case "$iface" in
+      ppp*)
+        if ifconfig "$iface" 2>/dev/null | grep -q 'inet '; then
+          printf '%s\n' "$iface"
+        fi
+        ;;
+    esac
   done
 }
 
-delete_routes() {
-  local network
-  for network in "${ROUTES[@]}"; do
-    sudo route -n delete -net "$network" >/dev/null 2>&1 || true
+find_new_ppp_interface() {
+  local iface
+  while IFS= read -r iface || [[ -n "$iface" ]]; do
+    [[ -n "$iface" ]] || continue
+    case "
+${INITIAL_PPP_INTERFACES}
+" in
+      *"
+${iface}
+"*) ;;
+      *) printf '%s\n' "$iface"; return 0 ;;
+    esac
+  done < <(list_ppp_interfaces)
+  return 1
+}
+
+route_interface() {
+  route -n get "${1:-$VPN_ROUTE_PROBE}" 2>/dev/null | awk '/interface:/{print $2; exit}'
+}
+
+session_process_running() {
+  pgrep -f "pppd.*linkname[[:space:]]+${SESSION_MARKER}" >/dev/null 2>&1 || \
+    pgrep -f "sstpc.*--ipparam[[:space:]]+${SESSION_MARKER}" >/dev/null 2>&1
+}
+
+add_route() {
+  local iface="$1"
+  ensure_private_dir "$RUNTIME_DIR"
+  if ! sudo -n route -n add -net "$VPN_ROUTE" -interface "$iface" >/dev/null; then
+    return 1
+  fi
+  printf '%s\n' "$iface" >"$ROUTE_STATE_FILE"
+  chmod 600 "$ROUTE_STATE_FILE"
+}
+
+delete_route() {
+  [[ -r "$ROUTE_STATE_FILE" ]] || return 0
+  # Soubor vznikne jen po uspesnem pridani teto konkretni trasy.
+  # Pokud ji mezitim odstranil zaniku PPP macOS, route pouze vrati chybu.
+  sudo -n route -n delete -net "$VPN_ROUTE" >/dev/null 2>&1 || true
+  rm -f "$ROUTE_STATE_FILE"
+}
+
+stop_vpn_processes() {
+  sudo -n pkill -TERM -f "pppd.*linkname[[:space:]]+${SESSION_MARKER}" >/dev/null 2>&1 || true
+  sudo -n pkill -TERM -f "sstpc.*--ipparam[[:space:]]+${SESSION_MARKER}" >/dev/null 2>&1 || true
+}
+
+url_encode_segment() {
+  local input="$1" output="" char hex i
+  LC_CTYPE=C
+  i=0
+  while [[ $i -lt ${#input} ]]; do
+    char="${input:$i:1}"
+    case "$char" in
+      [A-Za-z0-9._~-]) output="${output}${char}" ;;
+      *) printf -v hex '%%%02X' "'$char"; output="${output}${hex}" ;;
+    esac
+    i=$((i + 1))
   done
+  printf '%s\n' "$output"
 }
 
-open_mounts() {
-  [[ -r "$MOUNTS_FILE" ]] || return 0
-
-  local url
-  while IFS= read -r url || [[ -n "$url" ]]; do
-    [[ -z "$url" ]] && continue
-    case "$url" in \#*) continue ;; esac
-    open "$url" >/dev/null 2>&1 || true
-  done < "$MOUNTS_FILE"
+disk_host() {
+  case "$1" in
+    S|X) printf '%s\n' 'athena.ad.pslib.cz' ;;
+    L) printf '%s\n' 'bakalar.ad.pslib.cz' ;;
+    W) printf '%s\n' 'hermes.ad.pslib.cz' ;;
+    *) return 1 ;;
+  esac
 }
 
-list_pslib_smb_mountpoints() {
-  local host
-  for host in "${SMB_HOSTS[@]}"; do
-    mount | awk -v host="$host" '
-      $0 ~ "\\(smbfs" && $0 ~ host {
-        sub(/^.* on /, "")
-        sub(/ \\(.*$/, "")
-        print
-      }
-    '
+disk_share() {
+  case "$1" in
+    S) printf '%s\n' 'public' ;;
+    X) printf '%s\n' 'doma$' ;;
+    L) printf '%s\n' 'bakalari' ;;
+    W) printf '%s\n' 'homes' ;;
+    *) return 1 ;;
+  esac
+}
+
+disk_url() {
+  local disk="$1" host share
+  host="$(disk_host "$disk")"
+  share="$(disk_share "$disk")"
+  case "$disk" in
+    X) printf 'smb://%s/%s/%s\n' "$host" "$share" "$(url_encode_segment "$X_HOME")" ;;
+    *) printf 'smb://%s/%s\n' "$host" "$share" ;;
+  esac
+}
+
+mountpoints_for_disk() {
+  local disk="$1" host share
+  host="$(disk_host "$disk")"
+  share="$(disk_share "$disk")"
+  mount | awk -v host="$host" -v share="$share" '
+    index(tolower($0), "(smbfs") &&
+    index(tolower($0), tolower(host "/" share " on ")) {
+      line = $0
+      sub(/^.* on /, "", line)
+      sub(/ \(.*$/, "", line)
+      print line
+    }
+  '
+}
+
+line_in_text() {
+  local needle="$1" text="$2" line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "$needle" ]] && return 0
+  done <<<"$text"
+  return 1
+}
+
+record_managed_mount() {
+  ensure_private_dir "$RUNTIME_DIR"
+  printf '%s|%s\n' "$1" "$2" >>"$MOUNT_STATE_FILE"
+  chmod 600 "$MOUNT_STATE_FILE"
+}
+
+MOUNT_RESULT=""
+MOUNT_DETAIL=""
+
+mount_disk() {
+  local disk="$1" before after mountpoint url attempt max_attempts
+  before="$(mountpoints_for_disk "$disk")"
+  if [[ -n "$before" ]]; then
+    MOUNT_RESULT="preskocen"
+    MOUNT_DETAIL="uz byl pripojen"
+    return 0
+  fi
+  url="$(disk_url "$disk")"
+  if ! open "$url" >/dev/null 2>&1; then
+    MOUNT_RESULT="selhal"
+    MOUNT_DETAIL="macOS pozadavek na pripojeni odmitl"
+    return 0
+  fi
+
+  max_attempts="${PSLIB_MOUNT_WAIT_ATTEMPTS:-60}"
+  attempt=0
+  while [[ $attempt -lt $max_attempts ]]; do
+    after="$(mountpoints_for_disk "$disk")"
+    if [[ -n "$after" ]]; then
+      while IFS= read -r mountpoint || [[ -n "$mountpoint" ]]; do
+        [[ -n "$mountpoint" ]] || continue
+        if ! line_in_text "$mountpoint" "$before"; then
+          record_managed_mount "$disk" "$mountpoint"
+          MOUNT_RESULT="pripojen"
+          MOUNT_DETAIL=""
+          return 0
+        fi
+      done <<<"$after"
+    fi
+    sleep "${PSLIB_MOUNT_WAIT_SECONDS:-0.5}"
+    attempt=$((attempt + 1))
   done
+  MOUNT_RESULT="selhal"
+  MOUNT_DETAIL="server neodpovedel, prihlaseni bylo zruseno nebo chybi opravneni"
 }
 
-unmount_smb_mounts() {
-  local mountpoint
-  while IFS= read -r mountpoint || [[ -n "$mountpoint" ]]; do
-    [[ -n "$mountpoint" ]] || continue
-    diskutil unmount "$mountpoint" >/dev/null 2>&1 || umount "$mountpoint" >/dev/null 2>&1 || true
-  done < <(list_pslib_smb_mountpoints)
+mount_selected_disks() {
+  local disk mounted="" skipped="" failed=""
+  ensure_private_dir "$RUNTIME_DIR"
+  : >"$MOUNT_STATE_FILE"
+  chmod 600 "$MOUNT_STATE_FILE"
+  say "Pripojuji vybrane sitove disky..."
+  for disk in S X L W; do
+    if ! disk_selected "$disk"; then
+      skipped="${skipped:+$skipped, }$disk (neni vybran)"
+      continue
+    fi
+    mount_disk "$disk"
+    case "$MOUNT_RESULT" in
+      pripojen) mounted="${mounted:+$mounted, }$disk" ;;
+      preskocen) skipped="${skipped:+$skipped, }$disk ($MOUNT_DETAIL)" ;;
+      selhal) failed="${failed:+$failed, }$disk ($MOUNT_DETAIL)" ;;
+    esac
+  done
+  say "Prehled disku:"
+  say "  Pripojene: ${mounted:-zadne}"
+  say "  Preskocene: ${skipped:-zadne}"
+  say "  Selhaly: ${failed:-zadne}"
+  [[ -z "$failed" ]] || warn "VPN zustava pripojena. Disky muzes zkusit pozdeji novym pripojenim."
+}
+
+managed_mount_is_current() {
+  local disk="$1" expected="$2" current
+  current="$(mountpoints_for_disk "$disk")"
+  line_in_text "$expected" "$current"
+}
+
+unmount_managed_disks() {
+  local disk mountpoint remaining_file
+  [[ -r "$MOUNT_STATE_FILE" ]] || return 0
+  remaining_file="${MOUNT_STATE_FILE}.remaining.$$"
+  : >"$remaining_file"
+  chmod 600 "$remaining_file"
+  while IFS='|' read -r disk mountpoint || [[ -n "${disk}${mountpoint}" ]]; do
+    case "$disk" in S|X|L|W) ;; *) continue ;; esac
+    [[ "$mountpoint" == /Volumes/* ]] || continue
+    if ! managed_mount_is_current "$disk" "$mountpoint"; then
+      continue
+    fi
+    if diskutil unmount "$mountpoint" >/dev/null 2>&1 || \
+       umount "$mountpoint" >/dev/null 2>&1; then
+      say "Disk $disk byl odpojen."
+    else
+      warn "Disk $disk se nepodarilo odpojit. Zavri jeho soubory a spust znovu: pslib-vpn disconnect"
+      printf '%s|%s\n' "$disk" "$mountpoint" >>"$remaining_file"
+    fi
+  done <"$MOUNT_STATE_FILE"
+  if [[ -s "$remaining_file" ]]; then
+    mv "$remaining_file" "$MOUNT_STATE_FILE"
+  else
+    rm -f "$remaining_file" "$MOUNT_STATE_FILE"
+  fi
+}
+
+write_ppp_password_option() {
+  # Heslo tece pouze pres rouru. Transformace odstrani vystupni newline z
+  # `security -w` a escapuje syntaxi pppd options souboru.
+  printf 'password "'
+  security find-generic-password -a "$PSLIB_USER" \
+    -s "$(vpn_keychain_service)" -w 2>/dev/null | \
+    tr -d '\n' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+  printf '"\n'
+}
+
+show_connection_error() {
+  local rc="$1"
+  printf '\nVPN se nepodarilo pripojit. ' >&2
+  if [[ -r "$VPN_LOG" ]] && \
+     grep -Eqi 'auth|password|chap|denied|reject|failed to authenticate' "$VPN_LOG" 2>/dev/null; then
+    printf 'Server odmitl prihlaseni. Over udaje prikazem: pslib-vpn credentials\n' >&2
+  elif [[ "$rc" -eq 19 || "$rc" -eq 11 ]]; then
+    printf 'Over uzivatelske jmeno a heslo prikazem: pslib-vpn credentials\n' >&2
+  else
+    printf 'Zkontroluj internet a spust: pslib-vpn doctor\n' >&2
+  fi
+}
+
+cleanup_session() {
+  [[ "$CLEANED_UP" -eq 0 ]] || return 0
+  CLEANED_UP=1
+  set +e
+  unmount_managed_disks
+  delete_route
+  stop_vpn_processes
+  [[ -n "$VPN_LOG" ]] && rm -f "$VPN_LOG"
+  rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
 }
 
 connect_vpn() {
+  local sstpc_bin pppd_bin cert sstpc_command iface="" attempt rc=0
   require_cmd brew
-  require_cmd sstpc
   require_cmd security
   require_cmd ifconfig
   require_cmd route
+  require_cmd sudo
+  require_cmd open
+  require_cmd mount
+  require_cmd diskutil
+  require_cmd umount
+  require_cmd pgrep
 
   load_username
-  load_password
+  load_settings || die "Ulozeny vyber disku je neplatny. Spust: pslib-vpn setup"
+  validate_x_home "$X_HOME" || die "Nastaveni X_HOME je neplatne. Spust: pslib-vpn setup"
+  keychain_has_vpn_password || \
+    die "VPN heslo neni v Keychainu. Spust: pslib-vpn credentials"
+  if session_process_running; then
+    die "VPN uz bezi. Stav zjistis prikazem: pslib-vpn status"
+  fi
+  if [[ -s "$MOUNT_STATE_FILE" ]]; then
+    die "Po minulem behu zustaly sledovane disky. Nejdriv spust: pslib-vpn disconnect"
+  fi
 
-  local sstpc_bin cert log vpn_pid iface=""
-  sstpc_bin="$(command -v sstpc)"
+  ensure_private_dir "$RUNTIME_DIR"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    die "Jine pripojovani uz probiha. Pokud terminal spadl, spust: pslib-vpn disconnect"
+  fi
+  trap 'rmdir "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT
+
+  sstpc_bin="${PSLIB_SSTPC_BIN:-$(command -v sstpc || true)}"
+  pppd_bin="${PSLIB_PPPD_BIN:-/usr/sbin/pppd}"
+  [[ -x "$sstpc_bin" ]] || die "Chybi sstpc. Spust: brew install sstp-client"
+  [[ -x "$pppd_bin" ]] || die "Chybi systemovy pppd v $pppd_bin."
   cert="$(ca_cert)"
-  log="$(mktemp -t pslib-vpn)"
+  VPN_LOG="$(mktemp -t pslib-vpn.XXXXXX)"
+  chmod 600 "$VPN_LOG"
+  INITIAL_PPP_INTERFACES="$(list_ppp_interfaces)"
 
-  printf 'Ověřuji oprávnění sudo…\n'
-  sudo -v
+  trap cleanup_session EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
-  printf 'Připojuji %s…\n' "$VPN_HOST"
+  say "Overuji opravneni spravce..."
+  sudo -v || die "Bez opravneni spravce nelze spustit PPP tunel ani pridat sitovou trasu."
 
-  sudo "$sstpc_bin" \
-    --debug \
-    --log-level 2 \
-    --log-stderr \
-    --ca-cert "$cert" \
-    --user "$PSLIB_USER" \
-    --password "$VPN_PASSWORD" \
-    "$VPN_HOST" \
-    usepeerdns \
-    require-mschap-v2 \
-    noauth \
-    refuse-eap \
-    refuse-pap \
-    refuse-mschap \
-    noccp \
-    >"$log" 2>&1 &
+  sstpc_command="$(shell_quote "$sstpc_bin") --nolaunchpppd --ca-cert $(shell_quote "$cert") --tls-ext --ipparam $SESSION_MARKER --log-level 1 --log-stderr $(shell_quote "$VPN_HOST")"
 
-  vpn_pid=$!
-  unset VPN_PASSWORD
+  say "Pripojuji SSTP VPN $VPN_HOST..."
+  write_ppp_password_option | \
+    sudo -n "$pppd_bin" \
+      file /dev/stdin \
+      pty "$sstpc_command" \
+      user "$PSLIB_USER" \
+      linkname "$SESSION_MARKER" \
+      ipparam "$SESSION_MARKER" \
+      nodetach \
+      hide-password \
+      usepeerdns \
+      require-mschap-v2 \
+      noauth \
+      refuse-eap \
+      refuse-pap \
+      refuse-chap \
+      refuse-mschap \
+      noccp \
+      >"$VPN_LOG" 2>&1 &
+  VPN_PID=$!
 
-  cleanup() {
-    set +e
-    unmount_smb_mounts
-    delete_routes
-    sudo pkill -f "sstpc.*$(vpn_host_regex)" >/dev/null 2>&1 || true
-    rm -f "$log"
-  }
-  trap cleanup EXIT INT TERM
-
-  local i
-  for i in $(seq 1 30); do
-    iface="$(find_ppp_interface 2>/dev/null || true)"
-    if [[ -n "$iface" ]]; then
-      break
+  attempt=0
+  while [[ $attempt -lt "${PSLIB_VPN_WAIT_ATTEMPTS:-60}" ]]; do
+    iface="$(find_new_ppp_interface 2>/dev/null || true)"
+    [[ -n "$iface" ]] && break
+    if ! kill -0 "$VPN_PID" 2>/dev/null; then
+      wait "$VPN_PID" || rc=$?
+      show_connection_error "$rc"
+      return 1
     fi
-
-    if ! kill -0 "$vpn_pid" 2>/dev/null; then
-      printf '\nVPN se nepodařilo navázat:\n' >&2
-      cat "$log" >&2
-      exit 1
-    fi
-    sleep 0.5
+    sleep "${PSLIB_VPN_WAIT_SECONDS:-0.5}"
+    attempt=$((attempt + 1))
   done
 
-  [[ -n "$iface" ]] || {
-    printf '\nVPN tunel vznikl neúspěšně nebo nebylo nalezeno PPP rozhraní:\n' >&2
-    cat "$log" >&2
-    exit 1
-  }
+  if [[ -z "$iface" ]]; then
+    show_connection_error 1
+    return 1
+  fi
+  add_route "$iface" || die "VPN vznikla, ale nepodarilo se pridat trasu $VPN_ROUTE."
 
-  add_routes "$iface"
+  say "VPN je pripojena pres $iface."
+  mount_selected_disks
+  say "Hotovo. Pro bezpecne ukonceni stiskni Ctrl+C."
 
-  printf 'VPN připojena přes %s.\n' "$iface"
-  printf 'Route 10.10.10.0/24 → %s nastavena.\n' "$iface"
-
-  open_mounts
-
-  printf 'VPN běží. Pro ukončení stiskni Ctrl+C.\n'
-  wait "$vpn_pid"
+  wait "$VPN_PID" || rc=$?
+  if [[ "$rc" -ne 0 && "$rc" -ne 130 && "$rc" -ne 143 ]]; then
+    show_connection_error "$rc"
+    return "$rc"
+  fi
 }
 
 disconnect_vpn() {
-  sudo -v
-  unmount_smb_mounts
-  delete_routes
-  sudo pkill -f "sstpc.*$(vpn_host_regex)" >/dev/null 2>&1 || true
-  printf 'VPN proces ukončen, routes odstraněny a školní SMB svazky odpojeny.\n'
+  require_cmd sudo
+  require_cmd route
+  require_cmd mount
+  require_cmd diskutil
+  require_cmd umount
+  require_cmd pkill
+  ensure_private_dir "$RUNTIME_DIR"
+  say "Uklizim disky, VPN a sitovou trasu..."
+  unmount_managed_disks
+  if sudo -v; then
+    delete_route
+    stop_vpn_processes
+  else
+    warn "Bez opravneni spravce neslo ukoncit VPN proces ani odstranit trasu."
+    return 1
+  fi
+  rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
+  say "Uklid je dokoncen."
 }
 
 status_vpn() {
   local iface route_if
-  iface="$(find_ppp_interface 2>/dev/null || true)"
-  route_if="$(route_interface 10.10.10.10 || true)"
-
-  if [[ -n "$iface" ]]; then
-    printf 'PPP: %s\n' "$iface"
+  iface="$(list_ppp_interfaces | tr '\n' ' ')"
+  route_if="$(route_interface "$VPN_ROUTE_PROBE" || true)"
+  if session_process_running; then
+    say "VPN proces: bezi"
   else
-    printf 'PPP: nenalezeno\n'
+    say "VPN proces: nebezi"
   fi
-
-  if [[ -n "$route_if" ]]; then
-    printf '10.10.10.10 route: %s\n' "$route_if"
+  say "PPP rozhrani: ${iface:-nenalezeno}"
+  say "Trasa do skolni site: ${route_if:-nenalezena}"
+  if [[ -r "$MOUNT_STATE_FILE" ]]; then
+    say "Nastrojem sledovane SMB disky:"
+    awk -F'|' '{ print "  " $1 ": " $2 }' "$MOUNT_STATE_FILE"
   else
-    printf '10.10.10.10 route: nenalezena\n'
+    say "Nastrojem sledovane SMB disky: zadne"
   fi
 }
 
-forget_credentials() {
-  load_username
-  security delete-generic-password \
-    -a "$PSLIB_USER" \
-    -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
-  rm -f "$USERNAME_FILE"
-  printf 'Lokální uživatelské jméno a heslo z Keychainu byly odstraněny.\n'
+doctor_check() {
+  local label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf '  [OK] %s\n' "$label"
+    return 0
+  fi
+  printf '  [CHYBI] %s\n' "$label"
+  return 1
+}
+
+doctor() {
+  local failures=0 host disk cert_path=""
+  say "Kontrola PSLIB VPN"
+  doctor_check "macOS" test "$(uname -s)" = Darwin || failures=$((failures + 1))
+  doctor_check "Homebrew" command -v brew || failures=$((failures + 1))
+  doctor_check "sstpc" command -v sstpc || failures=$((failures + 1))
+  doctor_check "systemovy pppd" test -x /usr/sbin/pppd || failures=$((failures + 1))
+  doctor_check "macOS Keychain (security)" command -v security || failures=$((failures + 1))
+  if command -v brew >/dev/null 2>&1; then
+    cert_path="$(brew --prefix 2>/dev/null)/etc/ca-certificates/cert.pem"
+  fi
+  doctor_check "CA certifikaty" test -n "$cert_path" -a -r "$cert_path" || failures=$((failures + 1))
+
+  if [[ -r "$USERNAME_FILE" ]]; then
+    IFS= read -r PSLIB_USER <"$USERNAME_FILE" || true
+    if [[ -n "$PSLIB_USER" ]] && validate_username "$PSLIB_USER"; then
+      printf '  [OK] konfigurace uzivatele\n'
+      if keychain_has_vpn_password; then
+        printf '  [OK] VPN heslo v Keychainu\n'
+      else
+        printf '  [CHYBI] VPN heslo v Keychainu; spust: pslib-vpn credentials\n'
+        failures=$((failures + 1))
+      fi
+      if load_settings && validate_x_home "$X_HOME"; then
+        printf '  [OK] nastaveni SMB disku (%s)\n' "$SELECTED_DISKS"
+      else
+        printf '  [CHYBI] neplatne nastaveni disku; spust: pslib-vpn setup\n'
+        failures=$((failures + 1))
+      fi
+    else
+      printf '  [CHYBI] neplatna konfigurace; spust: pslib-vpn setup\n'
+      failures=$((failures + 1))
+    fi
+  else
+    printf '  [CHYBI] prvni nastaveni; spust: pslib-vpn setup\n'
+    failures=$((failures + 1))
+  fi
+
+  if command -v nc >/dev/null 2>&1 && nc -G 3 -z "$VPN_HOST" "$VPN_PORT" >/dev/null 2>&1; then
+    printf '  [OK] VPN server %s:%s je dostupny\n' "$VPN_HOST" "$VPN_PORT"
+  else
+    printf '  [VAROVANI] VPN server %s:%s ted neni dostupny\n' "$VPN_HOST" "$VPN_PORT"
+  fi
+  for disk in S X L W; do
+    host="$(disk_host "$disk")"
+    if route -n get "$host" >/dev/null 2>&1; then
+      printf '  [OK] SMB %s ma sitovou trasu (%s)\n' "$disk" "$host"
+    else
+      printf '  [INFO] SMB %s bude dostupne az pres VPN (%s)\n' "$disk" "$host"
+    fi
+  done
+
+  if [[ "$failures" -eq 0 ]]; then
+    say "Zakladni kontrola prosla. Skutecne prihlaseni overi az prikaz pslib-vpn."
+  else
+    say "Nalezeno problemu: $failures. Oprav polozky oznacene [CHYBI]."
+    return 1
+  fi
 }
 
 usage() {
   cat <<EOF
 pslib-vpn ${VERSION}
 
-Použití:
-  pslib-vpn              připojí VPN
-  pslib-vpn connect      připojí VPN
-  pslib-vpn setup        uloží uživatelské jméno a heslo do Keychainu
-  pslib-vpn status       zobrazí PPP rozhraní a route
-  pslib-vpn disconnect   ukončí VPN, odpojí SMB svazky a odstraní route
-  pslib-vpn forget       odstraní uložené přihlašovací údaje
-  pslib-vpn help         zobrazí tuto nápovědu
+Pouziti:
+  pslib-vpn                    pripoji SSTP VPN a vybrane SMB disky
+  pslib-vpn setup              provede prvni nastaveni bez rucnich uprav
+  pslib-vpn credentials        aktualizuje VPN ucet a heslo v Keychainu
+  pslib-vpn forget-credentials odstrani VPN heslo po potvrzeni
+  pslib-vpn status             zobrazi stav bez citlivych udaju
+  pslib-vpn disconnect         odpoji spravovane disky, VPN a trasu
+  pslib-vpn doctor             zkontroluje pripravenost pocitace
+  pslib-vpn help               zobrazi tuto napovedu
 EOF
 }
 
 case "${1:-connect}" in
   connect) connect_vpn ;;
-  setup) setup_credentials ;;
+  setup) setup ;;
+  credentials) update_credentials ;;
+  forget-credentials|forget) forget_credentials ;;
   status) status_vpn ;;
   disconnect) disconnect_vpn ;;
-  forget) forget_credentials ;;
+  doctor) doctor ;;
   help|-h|--help) usage ;;
   *) usage; exit 2 ;;
 esac

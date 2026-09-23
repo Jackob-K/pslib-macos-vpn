@@ -1,146 +1,245 @@
 # PSLIB macOS VPN
 
-Neoficiální pomocný CLI nástroj pro připojení macOS ke školní SSTP VPN SPŠSE a VOŠ Liberec (PSLIB) pomocí open-source `sstp-client`.
+Neoficiální nástroj pro připojení macOS ke školní SSTP VPN SPŠSE a VOŠ
+Liberec a k síťovým diskům S, X, L a W. SSTP přenáší program `sstpc`;
+systémový `pppd` zajišťuje pouze vnitřní PPP vrstvu SSTP spojení.
 
-> Tento projekt není oficiální software PSLIB. Používejte jej pouze s účtem, ke kterému máte oprávnění, a v souladu s pravidly školní sítě.
+> Projekt není oficiálním softwarem PSLIB. Používejte jej jen s účtem, ke
+> kterému máte oprávnění, a v souladu s pravidly školní sítě.
 
-## Co řeší
+Projekt zatím není označen jako `v1.0.0`. Před vydáním je nutné dokončit ruční
+testy uvedené na konci dokumentu.
 
-macOS nemá nativní SSTP klient. `pslib-vpn` proto:
+## Rychlý start
 
-1. použije `sstpc` z Homebrew,
-2. ověří server pomocí CA bundle z Homebrew,
-3. naváže PPP tunel,
-4. přidá route `10.10.10.0/24` přes vzniklé PPP rozhraní,
-5. volitelně otevře nakonfigurované SMB disky ve Finderu,
-6. při ukončení odpojí školní SMB svazky a uklidí route.
-
-PSLIB veřejně dokumentuje lokální úložiště na `athena.ad.pslib.cz`, včetně osobního disku X: a společného disku S:.
-
-## Požadavky
-
-- macOS
-- Homebrew
-- oprávněný účet PSLIB
-- administrátorské oprávnění na Macu (`sudo`)
-
-## Instalace
+Po stažení repozitáře spusťte:
 
 ```bash
-git clone <URL-REPOZITARE>
 cd pslib-macos-vpn
 ./install.sh
 source ~/.zprofile
-```
-
-Instalátor nainstaluje:
-
-```bash
-brew install sstp-client ca-certificates
-```
-
-a vloží `pslib-vpn` do `~/.local/bin`.
-
-## První nastavení
-
-```bash
 pslib-vpn setup
 ```
 
-Uživatelské jméno se uloží do:
+Průvodce se zeptá na školní účet, bezpečně uloží VPN heslo do macOS Keychainu
+a nabídne disky S, X, L a W. Pro studenta jsou předvolené S a X.
 
-```text
-~/.config/pslib-vpn/username
-```
-
-Heslo se **neukládá do repozitáře ani do konfiguračního souboru**. Ukládá se do macOS Keychainu jako generic password.
-
-## Připojení
+Běžné připojení má jediný příkaz:
 
 ```bash
 pslib-vpn
 ```
 
-nebo explicitně:
-
-```bash
-pslib-vpn connect
-```
-
-Po úspěšném připojení nástroj zůstane spuštěný v Terminálu. VPN ukončíte pomocí `Ctrl+C`; nástroj se pokusí odpojit školní SMB svazky ze serveru `athena.ad.pslib.cz`, odstranit route a ukončit VPN proces.
-
-Stav lze zkontrolovat:
-
-```bash
-pslib-vpn status
-```
-
-a případnou jinou běžící relaci ukončit:
+Terminál nechte otevřený. `Ctrl+C` odpojí svazky připojené tímto během,
+odstraní školní trasu a ukončí VPN. Po pádu nebo zavření Terminálu spusťte:
 
 ```bash
 pslib-vpn disconnect
 ```
 
-## SMB disky
+## Požadavky a oprávnění
 
-Po `pslib-vpn setup` vznikne:
+- macOS se systémovým `/usr/sbin/pppd` a příkazem `security`
+- Homebrew
+- oprávněný účet PSLIB
+- právo použít `sudo`
 
-```text
-~/.config/pslib-vpn/mounts
+Instalace Homebrew může na spravovaném Macu vyžadovat pomoc správce. Samotný
+Homebrew obvykle balíčky instaluje bez `sudo`, ale každé VPN připojení potřebuje
+správcovské oprávnění pro spuštění PPP a změnu routovací tabulky. Bez možnosti
+`sudo` tento způsob SSTP připojení nelze použít; správce školy musí nástroj
+povolit nebo dodat spravované VPN řešení.
+
+## Instalace
+
+```bash
+./install.sh
 ```
 
-Do něj lze přidat jeden SMB URL na řádek. Například společný disk S:
+Instalátor:
 
-```text
-smb://athena.ad.pslib.cz/public
+1. ověří macOS, systémový `pppd` a Keychain,
+2. nainstaluje `sstp-client` a `ca-certificates` přes Homebrew,
+3. nainstaluje příkaz do `~/.local/bin/pslib-vpn`,
+4. případně přidá `~/.local/bin` do `~/.zprofile`.
+
+První nastavení nevyžaduje ruční úpravu souborů:
+
+```bash
+pslib-vpn setup
 ```
 
-PSLIB veřejně uvádí osobní disk X: jako:
+Necitlivá lokální konfigurace je v `~/.config/pslib-vpn` s oprávněním pouze
+pro vlastníka. Hesla tam nejsou.
 
-```text
-\\athena.ad.pslib.cz\doma$\jmeno.prijmeni
+## Keychain a VPN heslo
+
+VPN heslo spravují tyto příkazy:
+
+```bash
+pslib-vpn credentials
+pslib-vpn forget-credentials
 ```
 
-Na macOS tomu odpovídá například:
+`credentials` aktualizuje jméno a položku `PSLIB VPN` v uživatelském macOS
+Keychainu. Heslo si bezpečně vyžádá přímo systémový příkaz `security`; shell jej
+nevypisuje ani nepřidává do historie. `forget-credentials` vyžaduje potvrzení a
+pak položku z Keychainu odstraní.
+
+Při připojení se heslo načte příkazem `security find-generic-password -w` a
+anonymní rourou se předá jako obsah options souboru na `/dev/stdin` programu
+`pppd`. `pppd` je spuštěn s `hide-password` a spouští:
 
 ```text
-smb://athena.ad.pslib.cz/doma$/jmeno.prijmeni
+sstpc --nolaunchpppd ... hecate.pslib.cz
 ```
 
-Při prvním `setup` se disk S: předvyplní jako aktivní položka. Osobní disk X: se předvyplní jako komentovaný příklad odvozený z uživatelského jména; odkomentujte jej, pokud odpovídá vašemu účtu.
+Heslo proto není v argumentech `security`, `sudo`, `pppd` ani `sstpc`, není v
+shellové historii a `sstpc` ho vůbec nezná. Nevzniká ani dočasný soubor s
+heslem. Nainstalovaný `sstpc 1.0.20` nabízí pro heslo pouze nebezpečný argument
+`--password`; ten projekt nepoužívá. Apple `pppd 2.4.2` umí číst options přes
+`file /dev/stdin`, podporuje MS-CHAPv2 a `pty`, což je použitý mechanismus.
 
-Další interní disky, například L: a W:, nejsou v tomto repozitáři předvyplněny, protože jejich přesné SMB cesty a oprávnění se mohou lišit podle role uživatele. Přidejte je lokálně do souboru `mounts`, pokud jejich cestu znáte a máte k nim oprávnění. Pokud macOS vyžádá autentizaci pro některý disk zvlášť, uložte ji do Keychainu přes systémový dialog Finderu.
+Apple `pppd` obsahuje také `userkeychainpassword`, ale při spuštění přes `sudo`
+by hledal Keychain uživatele root. Globální `/etc/ppp/chap-secrets` by zase
+zapisoval heslo na disk. Ani jedna varianta proto není použita.
 
-Příklad výsledného lokálního souboru:
+## Síťové disky
+
+Výběr disků lze kdykoli změnit opětovným spuštěním:
+
+```bash
+pslib-vpn setup
+```
+
+| Disk | Účel | SMB cesta |
+| --- | --- | --- |
+| S | společný školní prostor | `smb://athena.ad.pslib.cz/public` |
+| X | osobní adresář | `smb://athena.ad.pslib.cz/doma$/jmeno.prijmeni` |
+| L | učitelský disk Bakaláři | `smb://bakalar.ad.pslib.cz/bakalari` |
+| W | veřejné webové stránky | `smb://hermes.ad.pslib.cz/homes` |
+
+Jméno adresáře X se odvodí z části školního uživatelského jména před `@` a v
+průvodci je lze změnit. Řetězec `doma$` je ve skriptu vždy uzavřen v uvozovkách,
+takže `$` shell nerozvine. Uživatelský segment je validován a URL kódován.
+
+Disky se otevírají systémovým příkazem `open` a připojuje je Finder. Je to na
+macOS bezpečnější než skládat CLI příkaz s heslem: heslo není v SMB URL ani v
+argumentech procesu a macOS zobrazí vlastní přihlašovací dialog. Pokud uživatel
+zvolí uložení, přihlašovací údaje spravuje systémový Keychain pro konkrétní SMB
+server.
+
+Identita pro VPN, Athenu, Bakaláře a Hermes se automaticky nesjednocuje. Disk L
+vyžaduje školní e-mail a síťové heslo; případná uložená položka patří serveru
+`bakalar.ad.pslib.cz`. Disk W může server studentovi odmítnout. Selhání jednoho
+disku neukončí VPN ani neblokuje ostatní disky.
+
+Nástroj před připojením a po něm porovná seznam SMB svazků. Zapíše si pouze
+nově vzniklé svazky a při úklidu znovu ověří jejich server a share. Již dříve
+připojený svazek označí jako přeskočený a nikdy jej neodpojí. Tím chrání jiné
+síťové disky uživatele, včetně disků ze stejného serveru.
+
+## Příkazy
 
 ```text
-smb://athena.ad.pslib.cz/public
-smb://athena.ad.pslib.cz/doma$/jmeno.prijmeni
-# smb://athena.ad.pslib.cz/nejaky-dalsi-share
+pslib-vpn                    připojí SSTP VPN a vybrané SMB disky
+pslib-vpn setup              nastaví účet a výběr disků
+pslib-vpn credentials        aktualizuje VPN účet a heslo
+pslib-vpn forget-credentials odstraní VPN heslo po potvrzení
+pslib-vpn status             zobrazí stav bez citlivých údajů
+pslib-vpn disconnect         uklidí disky, VPN a trasu
+pslib-vpn doctor             provede bezpečnou diagnostiku
 ```
 
-## Bezpečnost
+## Diagnostika
 
-- Heslo není součástí repozitáře.
-- Heslo je uloženo v macOS Keychainu.
-- Skript používá ověření TLS certifikátu; nepoužívá `--cert-warn`.
-- `sstpc` při tomto způsobu připojení vyžaduje uživatelské jméno a heslo jako argumenty příkazové řádky. Heslo se tedy při běhu předává procesu `sstpc`; to je omezení tohoto jednoduchého způsobu použití upstream klienta. Pro prostředí s vyššími požadavky na ochranu lokálního procesu by bylo vhodné přejít na konfiguraci přes `pppd`/peer profil.
-- Nikdy necommitujte soubory z `~/.config/pslib-vpn` ani exporty Keychainu.
+```bash
+pslib-vpn doctor
+pslib-vpn status
+```
+
+`doctor` bez zobrazení hesla kontroluje systémové nástroje, Homebrew balíčky,
+CA certifikáty, konfiguraci, existenci položky v Keychainu, dostupnost VPN
+serveru na TCP 443 a připravenost SMB cest. SMB servery mohou být dosažitelné
+až po připojení VPN; takový stav je uveden jako informace, ne jako únik hesla.
+
+Časté situace:
+
+- „VPN heslo není v Keychainu“: spusťte `pslib-vpn credentials`.
+- Server odmítl přihlášení: zkontrolujte jméno a aktualizujte heslo.
+- VPN už běží: použijte `pslib-vpn status`; druhý tunel se nevytvoří.
+- Po pádu zůstal stav: spusťte `pslib-vpn disconnect` a potom připojení znovu.
+- Disk L otevře dialog: použijte školní e-mail, ne automaticky VPN identitu.
+- Disk W selže: účet pravděpodobně nemá oprávnění; VPN zůstane funkční.
+- Disk nelze odpojit: zavřete jeho soubory a zopakujte `disconnect`.
+
+## Bezpečnostní omezení
+
+- Uživatelské jméno není heslo a je viditelné v argumentu `pppd user`.
+- Heslo krátce existuje v paměti procesů `security`, transformační roury a
+  `pppd`; správce systému nebo proces s odpovídajícími právy může paměť procesu
+  teoreticky zkoumat.
+- Heslo nesmí obsahovat znak nového řádku. Interaktivní Keychain výzva jej
+  standardně ani neumožňuje zadat jako součást hesla.
+- Nástroj úmyslně nepodporuje `set -x`; na začátku trasování vypíná. Heslo se
+  nevypisuje ani v diagnostickém režimu.
+- TLS certifikát serveru se ověřuje přes Homebrew CA bundle. Volba
+  `--cert-warn` se nepoužívá.
+- `kill -9` nelze zachytit. Stav spravovaných disků však zůstane uložený a
+  následný `pslib-vpn disconnect` provede úklid.
+- Konfiguraci `~/.config/pslib-vpn`, exporty Keychainu a diagnostické soubory s
+  osobními údaji nikdy nepřidávejte do Gitu.
+
+## Testy a správci
+
+Automatické testy nepřipojují skutečnou VPN a nepoužívají skutečné heslo:
+
+```bash
+./tests/run.sh
+bash -n bin/pslib-vpn install.sh uninstall.sh tests/run.sh
+git diff --check
+```
+
+Harness používá mocky pro `security`, `sstpc`, `pppd`, `mount`, `umount`,
+`sudo` a další systémové příkazy. Ověřuje bezpečný stdin kanál, chybějící
+Keychain, odmítnutou autentizaci, opakovaný běh, přerušení, selhání SMB,
+selektivní odpojení a potvrzení při mazání údajů.
+
+Správce může před nasazením prověřit, že `/usr/sbin/pppd` stále přijímá volby
+`file`, `pty`, `user`, `hide-password` a MS-CHAPv2 a že verze `sstpc` podporuje
+`--nolaunchpppd`. Změna nebo odstranění systémového `pppd` v budoucí verzi
+macOS bude vyžadovat novou implementaci; skript nezkouší neexistující volby.
 
 ## Odinstalace
 
 ```bash
-pslib-vpn forget
-rm -f ~/.local/bin/pslib-vpn
-rm -rf ~/.config/pslib-vpn
+./uninstall.sh
 ```
 
-Závislosti lze případně odebrat:
+Odinstalátor se nejdřív pokusí odpojit spravované svazky a VPN, nabídne
+odstranění hesla z Keychainu a potom odstraní program i neškodnou konfiguraci.
+Homebrew balíčky ponechá. Volitelně je lze odstranit:
 
 ```bash
-brew uninstall sstp-client
+brew uninstall sstp-client ca-certificates
 ```
+
+## Checklist před v1.0.0
+
+- [ ] Instalace na čistém standardním uživatelském účtu macOS.
+- [ ] Ověření s účtem, který smí použít potřebné `sudo`, nebo se správcem.
+- [ ] `pslib-vpn setup` a kontrola, že heslo je pouze v uživatelském Keychainu.
+- [ ] Skutečné připojení k `hecate.pslib.cz` se správnými údaji.
+- [ ] Odmítnutí chybného hesla bez jeho výpisu v Terminálu a `ps`.
+- [ ] Ověření, že školní route vede přes nově vzniklé PPP rozhraní.
+- [ ] Připojení S a X se studentským účtem.
+- [ ] Připojení L učitelským účtem a samostatný Keychain záznam pro Bakaláře.
+- [ ] Ověření očekávaného povolení nebo odmítnutí W.
+- [ ] `Ctrl+C` odpojí jen svazky vytvořené daným během.
+- [ ] Násilné zavření Terminálu a následný `pslib-vpn disconnect` vše uklidí.
+- [ ] Opakované spuštění nevytvoří druhou VPN ani duplicitní SMB svazky.
+- [ ] Kontrola na podporované aktuální verzi macOS a Apple Silicon i Intel Macu.
 
 ## Licence
 
-MIT
+MIT, viz [LICENSE](LICENSE).

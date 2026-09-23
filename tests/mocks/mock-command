@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -u
+
+name="$(basename "$0")"
+mock_dir="${MOCK_DIR:?}"
+mock_log="${MOCK_LOG:?}"
+mkdir -p "$mock_dir" "$mock_log"
+
+log_args() {
+  printf '%s' "$name" >>"$mock_log/commands.log"
+  printf ' <%s>' "$@" >>"$mock_log/commands.log"
+  printf '\n' >>"$mock_log/commands.log"
+}
+
+case "$name" in
+  security)
+    log_args "$@"
+    action="${1:-}"
+    case "$action" in
+      add-generic-password)
+        read -r secret
+        printf '%s' "$secret" >"$mock_dir/keychain"
+        chmod 600 "$mock_dir/keychain"
+        ;;
+      find-generic-password)
+        [[ -r "$mock_dir/keychain" ]] || exit 44
+        cat "$mock_dir/keychain"
+        printf '\n'
+        ;;
+      delete-generic-password)
+        [[ -e "$mock_dir/keychain" ]] || exit 44
+        rm -f "$mock_dir/keychain"
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  sudo)
+    log_args "$@"
+    case "${1:-}" in
+      -v) exit 0 ;;
+      -n) shift ;;
+    esac
+    exec "$@"
+    ;;
+  pppd)
+    log_args "$@"
+    previous=""
+    for argument in "$@"; do
+      if [[ "$previous" == "pty" ]]; then
+        /bin/sh -c "$argument" </dev/null >/dev/null 2>&1 || true
+        break
+      fi
+      previous="$argument"
+    done
+    options="$(cat)"
+    if [[ "$options" == *"${MOCK_SECRET_SENTINEL:-mock-secret}"* ]]; then
+      : >"$mock_dir/password-received-on-stdin"
+    else
+      printf 'authentication failed\n' >&2
+      exit 19
+    fi
+    if [[ "${MOCK_PPPD_EXIT:-0}" -ne 0 ]]; then
+      printf 'authentication failed\n' >&2
+      exit "${MOCK_PPPD_EXIT}"
+    fi
+    if [[ "${MOCK_NO_INTERFACE:-0}" -ne 1 ]]; then
+      : >"$mock_dir/vpn-up"
+    fi
+    /bin/sleep "${MOCK_PPPD_SLEEP:-0.6}"
+    rm -f "$mock_dir/vpn-up"
+    ;;
+  sstpc)
+    log_args "$@"
+    ;;
+  brew)
+    if [[ "${1:-}" == "--prefix" ]]; then
+      printf '%s\n' "${MOCK_BREW_PREFIX:?}"
+    else
+      exit 2
+    fi
+    ;;
+  ifconfig)
+    if [[ "${1:-}" == "-l" ]]; then
+      if [[ -e "$mock_dir/vpn-up" ]]; then
+        printf 'lo0 ppp0\n'
+      else
+        printf 'lo0\n'
+      fi
+    elif [[ "${1:-}" == "ppp0" && -e "$mock_dir/vpn-up" ]]; then
+      printf 'ppp0: flags=8051\n\tinet 10.0.0.2 --> 10.0.0.1\n'
+    else
+      exit 1
+    fi
+    ;;
+  route)
+    log_args "$@"
+    if [[ "$*" == *" get "* && -e "$mock_dir/vpn-up" ]]; then
+      printf '   interface: ppp0\n'
+    elif [[ "$*" == *" get "* ]]; then
+      exit 1
+    fi
+    ;;
+  pgrep)
+    [[ "${MOCK_ACTIVE:-0}" -eq 1 ]]
+    ;;
+  pkill)
+    log_args "$@"
+    rm -f "$mock_dir/vpn-up"
+    ;;
+  mount)
+    [[ -r "$mock_dir/mounts" ]] && cat "$mock_dir/mounts"
+    ;;
+  open)
+    log_args "$@"
+    url="${1:-}"
+    if [[ "$url" == *"hermes.ad.pslib.cz"* && "${MOCK_FAIL_W:-0}" -eq 1 ]]; then
+      exit 1
+    fi
+    case "$url" in
+      *athena.ad.pslib.cz/public*)
+        printf '//mock@athena.ad.pslib.cz/public on /Volumes/S (smbfs, nodev)\n' >>"$mock_dir/mounts"
+        ;;
+      *'athena.ad.pslib.cz/doma$/'*)
+        printf '//mock@athena.ad.pslib.cz/doma$ on /Volumes/X (smbfs, nodev)\n' >>"$mock_dir/mounts"
+        ;;
+      *bakalar.ad.pslib.cz/bakalari*)
+        printf '//teacher@bakalar.ad.pslib.cz/bakalari on /Volumes/L (smbfs, nodev)\n' >>"$mock_dir/mounts"
+        ;;
+      *hermes.ad.pslib.cz/homes*)
+        printf '//mock@hermes.ad.pslib.cz/homes on /Volumes/W (smbfs, nodev)\n' >>"$mock_dir/mounts"
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  diskutil|umount)
+    log_args "$@"
+    if [[ "$name" == "diskutil" && "${MOCK_DISKUTIL_FAIL:-0}" -eq 1 ]]; then
+      exit 1
+    fi
+    mountpoint="${2:-${1:-}}"
+    awk -v target=" on ${mountpoint} (" 'index($0, target) == 0' \
+      "$mock_dir/mounts" >"$mock_dir/mounts.new" 2>/dev/null || true
+    mv "$mock_dir/mounts.new" "$mock_dir/mounts"
+    ;;
+  nc)
+    exit "${MOCK_NC_EXIT:-0}"
+    ;;
+  *)
+    printf 'Neznamy mock: %s\n' "$name" >&2
+    exit 127
+    ;;
+esac

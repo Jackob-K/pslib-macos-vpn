@@ -1,2 +1,9 @@
 .DS_Store
 *.log
+.env
+.env.*
+!.env.example
+*.keychain
+*.secret
+config.local
+.test-tmp/

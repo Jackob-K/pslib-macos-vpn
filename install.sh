@@ -18,6 +18,11 @@ EOF
   exit 1
 fi
 
+if [[ ! -x /usr/sbin/pppd ]] || ! command -v security >/dev/null 2>&1; then
+  echo "V systemu chybi pppd nebo macOS Keychain. Tato verze macOS neni podporovana." >&2
+  exit 1
+fi
+
 echo "Instaluji závislosti…"
 brew install sstp-client ca-certificates
 
