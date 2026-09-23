@@ -66,7 +66,9 @@ keychain_has_vpn_password() {
 
 store_vpn_password() {
   local username="$1"
-  say "Zadej heslo do skolni site. Pri psani se nebude zobrazovat."
+  say "Nyni zadej SKOLNI sitove heslo k uctu $username."
+  say "Nejde o heslo k tomuto Macu. Pri psani se heslo nebude zobrazovat."
+  say "Pokud macOS pozada o odemceni Klicenky, do systemoveho dialogu zadej heslo k Macu."
   security add-generic-password -U -a "$username" \
     -s "$(vpn_keychain_service)" -l "PSLIB VPN" -w || \
     die "Heslo se nepodarilo ulozit do macOS Keychainu. Zkus prikaz znovu."
@@ -148,7 +150,9 @@ configure_disks() {
 
   proposed_x="$(username_without_realm "$PSLIB_USER")"
   if disk_selected X; then
-    read -r -p "Nazev osobniho adresare X [$proposed_x]: " answer
+    say "Osobni adresar X je obvykle cast skolniho e-mailu pred znakem @."
+    say "Navrzena cesta: smb://athena.ad.pslib.cz/doma\$/$proposed_x"
+    read -r -p "Nazev slozky na disku X [$proposed_x] (Enter = pouzit navrh): " answer
     answer="$(trim "$answer")"
     X_HOME="${answer:-$proposed_x}"
     validate_x_home "$X_HOME" || \
@@ -177,11 +181,13 @@ update_credentials() {
     IFS= read -r old_username <"$USERNAME_FILE" || true
   fi
   if [[ -n "$old_username" ]]; then
-    read -r -p "Skolni uzivatelske jmeno [$old_username]: " answer
+    read -r -p "Skolni e-mail / VPN uzivatelske jmeno [$old_username]: " answer
     answer="$(trim "$answer")"
     username="${answer:-$old_username}"
   else
-    read -r -p "Skolni uzivatelske jmeno (napr. jmeno.prijmeni@pslib.cz): " username
+    say "Ucitel:  jmeno.prijmeni@pslib.cz"
+    say "Student: jmeno.prijmeni.rok@pslib.cz"
+    read -r -p "Skolni e-mail / VPN uzivatelske jmeno: " username
     username="$(trim "$username")"
   fi
   [[ -n "$username" ]] || die "Uzivatelske jmeno nesmi byt prazdne."
@@ -558,6 +564,8 @@ connect_vpn() {
   trap 'exit 143' TERM
 
   say "Overuji opravneni spravce..."
+  say "macOS muze nyni pozadat o heslo k UZIVATELSKEMU UCTU TOHOTO MACU kvuli sudo."
+  say "V teto vyzve nezadavej skolni sitove heslo."
   sudo -v || die "Bez opravneni spravce nelze spustit PPP tunel ani pridat sitovou trasu."
 
   sstpc_command="$(shell_quote "$sstpc_bin") --nolaunchpppd --ca-cert $(shell_quote "$cert") --tls-ext --ipparam $SESSION_MARKER --log-level 1 --log-stderr $(shell_quote "$VPN_HOST")"

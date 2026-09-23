@@ -24,6 +24,10 @@ pslib-vpn setup
 Průvodce se zeptá na školní účet, bezpečně uloží VPN heslo do macOS Keychainu
 a nabídne disky S, X, L a W. Pro studenta jsou předvolené S a X.
 
+Školní účet má pro učitele tvar `jmeno.prijmeni@pslib.cz` a pro studenty
+`jmeno.prijmeni.rok@pslib.cz`. Průvodce vždy výslovně rozlišuje školní síťové
+heslo od hesla k lokálnímu účtu na Macu, které může později vyžádat `sudo`.
+
 Běžné připojení má jediný příkaz:
 
 ```bash
@@ -86,6 +90,11 @@ Keychainu. Heslo si bezpečně vyžádá přímo systémový příkaz `security`
 nevypisuje ani nepřidává do historie. `forget-credentials` vyžaduje potvrzení a
 pak položku z Keychainu odstraní.
 
+Terminálová výzva při ukládání položky chce **školní síťové heslo**. Pokud
+macOS zobrazí samostatný systémový dialog pro odemčení přihlašovací Klíčenky,
+do něj patří heslo k uživatelskému účtu na Macu. Při samotném připojení může
+`sudo` znovu požádat o heslo k Macu; nejde o školní heslo.
+
 Při připojení se heslo načte příkazem `security find-generic-password -w` a
 anonymní rourou se předá jako obsah options souboru na `/dev/stdin` programu
 `pppd`. `pppd` je spuštěn s `hide-password` a spouští:
@@ -115,13 +124,15 @@ pslib-vpn setup
 | Disk | Účel | SMB cesta |
 | --- | --- | --- |
 | S | společný školní prostor | `smb://athena.ad.pslib.cz/public` |
-| X | osobní adresář | `smb://athena.ad.pslib.cz/doma$/jmeno.prijmeni` |
+| X | osobní adresář | `smb://athena.ad.pslib.cz/doma$/cast-emailu-pred-@` |
 | L | učitelský disk Bakaláři | `smb://bakalar.ad.pslib.cz/bakalari` |
 | W | veřejné webové stránky | `smb://hermes.ad.pslib.cz/homes` |
 
-Jméno adresáře X se odvodí z části školního uživatelského jména před `@` a v
-průvodci je lze změnit. Řetězec `doma$` je ve skriptu vždy uzavřen v uvozovkách,
-takže `$` shell nerozvine. Uživatelský segment je validován a URL kódován.
+Jméno adresáře X se odvodí z části školního uživatelského jména před `@`: pro
+učitele typicky `jmeno.prijmeni`, pro studenta typicky `jmeno.prijmeni.rok`.
+Průvodce před potvrzením zobrazí celou navrženou SMB cestu a hodnotu lze změnit.
+Řetězec `doma$` je ve skriptu vždy uzavřen v uvozovkách, takže `$` shell
+nerozvine. Uživatelský segment je validován a URL kódován.
 
 Disky se otevírají systémovým příkazem `open` a připojuje je Finder. Je to na
 macOS bezpečnější než skládat CLI příkaz s heslem: heslo není v SMB URL ani v
