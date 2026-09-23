@@ -24,9 +24,11 @@ pslib-vpn setup
 Průvodce se zeptá na školní účet, bezpečně uloží VPN heslo do macOS Keychainu
 a nabídne disky S, X, L a W. Pro studenta jsou předvolené S a X.
 
-Školní účet má pro učitele tvar `jmeno.prijmeni@pslib.cz` a pro studenty
-`jmeno.prijmeni.rok@pslib.cz`. Průvodce vždy výslovně rozlišuje školní síťové
-heslo od hesla k lokálnímu účtu na Macu, které může později vyžádat `sudo`.
+VPN účet vznikne z uživatelského jména do školní počítačové sítě doplněním
+`@pslib.cz`. Zejména u studentů nemusí být toto VPN jméno stejné jako jejich
+e-mailová adresa Office 365 ve tvaru `jmeno.prijmeni.rok@pslib.cz`. Průvodce
+vždy výslovně rozlišuje školní síťové heslo od hesla k lokálnímu účtu na Macu,
+které může později vyžádat `sudo`.
 
 Běžné připojení má jediný příkaz:
 
@@ -128,11 +130,12 @@ pslib-vpn setup
 | L | učitelský disk Bakaláři | `smb://bakalar.ad.pslib.cz/bakalari` |
 | W | veřejné webové stránky | `smb://hermes.ad.pslib.cz/homes` |
 
-Jméno adresáře X se odvodí z části školního uživatelského jména před `@`: pro
-učitele typicky `jmeno.prijmeni`, pro studenta typicky `jmeno.prijmeni.rok`.
-Průvodce před potvrzením zobrazí celou navrženou SMB cestu a hodnotu lze změnit.
-Řetězec `doma$` je ve skriptu vždy uzavřen v uvozovkách, takže `$` shell
-nerozvine. Uživatelský segment je validován a URL kódován.
+Jméno adresáře X je typicky ve tvaru `jmeno.prijmeni`. Průvodce jako výchozí
+návrh použije část VPN jména před `@`, ale výslovně upozorní, že zejména u
+studentských účtů se může název X od VPN jména lišit. Před potvrzením zobrazí
+celou navrženou SMB cestu a hodnotu lze změnit. Řetězec `doma$` je ve skriptu
+vždy uzavřen v uvozovkách, takže `$` shell nerozvine. Uživatelský segment je
+validován a URL kódován.
 
 Disky se otevírají systémovým příkazem `open` a připojuje je Finder. Je to na
 macOS bezpečnější než skládat CLI příkaz s heslem: heslo není v SMB URL ani v

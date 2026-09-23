@@ -150,7 +150,8 @@ configure_disks() {
 
   proposed_x="$(username_without_realm "$PSLIB_USER")"
   if disk_selected X; then
-    say "Osobni adresar X je obvykle cast skolniho e-mailu pred znakem @."
+    say "Nazev osobniho adresare X je obvykle ve tvaru jmeno.prijmeni."
+    say "Nemusi byt stejny jako VPN jmeno, zejmena u studentskych uctu."
     say "Navrzena cesta: smb://athena.ad.pslib.cz/doma\$/$proposed_x"
     read -r -p "Nazev slozky na disku X [$proposed_x] (Enter = pouzit navrh): " answer
     answer="$(trim "$answer")"
@@ -181,13 +182,13 @@ update_credentials() {
     IFS= read -r old_username <"$USERNAME_FILE" || true
   fi
   if [[ -n "$old_username" ]]; then
-    read -r -p "Skolni e-mail / VPN uzivatelske jmeno [$old_username]: " answer
+    read -r -p "VPN jmeno (sitovy ucet doplneny o @pslib.cz) [$old_username]: " answer
     answer="$(trim "$answer")"
     username="${answer:-$old_username}"
   else
-    say "Ucitel:  jmeno.prijmeni@pslib.cz"
-    say "Student: jmeno.prijmeni.rok@pslib.cz"
-    read -r -p "Skolni e-mail / VPN uzivatelske jmeno: " username
+    say "Pouzij prihlasovaci jmeno jako do skolniho PC a dopln @pslib.cz."
+    say "Pozor: zejmena u studentu to nemusi byt stejna adresa jako e-mail Office 365."
+    read -r -p "VPN jmeno (napr. sitove.uzivatelske.jmeno@pslib.cz): " username
     username="$(trim "$username")"
   fi
   [[ -n "$username" ]] || die "Uzivatelske jmeno nesmi byt prazdne."
